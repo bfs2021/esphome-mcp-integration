@@ -19,7 +19,19 @@ from typing import Any
 from .dashboard import CommandResult
 from .exceptions import DeviceLogError
 
+try:  # aioesphomeapi is optional; HA always ships a compatible copy.
+    from aioesphomeapi import LogLevel
+except ImportError:  # pragma: no cover - only when streaming is unavailable
+    LogLevel = None  # type: ignore[assignment]
+
 _LOGGER = logging.getLogger(__name__)
+
+#: Subscribe at the most verbose level; the device caps the stream at its
+#: compiled ``logger:`` level. Without an explicit level the protobuf
+#: default (0 = LOG_LEVEL_NONE) asks for no logs at all.
+_DEVICE_LOG_LEVEL = (
+    int(LogLevel.LOG_LEVEL_VERY_VERBOSE) if LogLevel is not None else 6
+)
 
 DEFAULT_NATIVE_PORT = 6053
 DEFAULT_LOG_SECONDS = 30
@@ -77,7 +89,9 @@ async def async_stream_device_logs(
     unsubscribe: Callable[[], None] | None = None
     try:
         await client.connect(login=True)
-        unsubscribe = client.subscribe_logs(_on_log)
+        unsubscribe = client.subscribe_logs(
+            _on_log, log_level=_DEVICE_LOG_LEVEL, dump_config=False
+        )
         try:
             await asyncio.wait_for(done.wait(), timeout=max_seconds)
         except TimeoutError:
@@ -98,4 +112,9 @@ async def async_stream_device_logs(
             pass
 
     result.exit_code = 0
+    if not result.lines:
+        result.lines.append(
+            f"no log lines received in {max_seconds:g}s; "
+            "check the device's logger: level"
+        )
     return result

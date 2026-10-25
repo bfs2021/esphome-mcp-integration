@@ -25,7 +25,8 @@ class FakeClient:
             raise RuntimeError("connection refused")
         self.connected = True
 
-    def subscribe_logs(self, on_log, log_level=None):
+    def subscribe_logs(self, on_log, log_level=None, dump_config=None):
+        self.subscribe_args = (log_level, dump_config)
         for msg in self._logs:
             on_log(msg)
 
@@ -69,6 +70,26 @@ async def test_connect_failure_raises_and_still_disconnects():
             "1.2.3.4", max_seconds=0.05, client_factory=lambda: client
         )
     assert client.disconnected is True
+
+
+async def test_subscribes_very_verbose_without_the_config_dump():
+    """LOG_LEVEL_NONE (the protobuf default) is why a device capture was empty."""
+    client = FakeClient(logs=[FakeMsg(b"line")])
+    await async_stream_device_logs(
+        "1.2.3.4", max_seconds=0.05, client_factory=lambda: client
+    )
+    assert client.subscribe_args == (6, False)
+
+
+async def test_an_empty_capture_says_why():
+    client = FakeClient(logs=[])
+    result = await async_stream_device_logs(
+        "1.2.3.4", max_seconds=0.05, client_factory=lambda: client
+    )
+    assert result.success is True
+    assert len(result.lines) == 1
+    assert "no log lines received" in result.lines[0]
+    assert "logger: level" in result.lines[0]
 
 
 async def test_handles_str_messages():
