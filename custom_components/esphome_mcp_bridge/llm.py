@@ -152,12 +152,22 @@ def _insert_secret(path: str, key: str, value: str) -> None:
         fh.write(f"{prefix}{key}: {json.dumps(value)}\n")
 
 
-async def _async_connection(hass: HomeAssistant, slug: str | None):
+def _user_id(llm_context: llm.LLMContext) -> str | None:
+    """The HA user invoking the tool; ingress sessions are minted as this user."""
+    context = llm_context.context
+    return context.user_id if context is not None else None
+
+
+async def _async_connection(
+    hass: HomeAssistant, slug: str | None, user_id: str | None
+):
     """Resolve the add-on and open a dashboard connection (base URL + auth).
 
     Shared by :func:`_async_dashboard` (legacy REST + WS spawn) and
     :func:`_async_build_client` (the multiplexed ``/ws`` API); both talk to the
-    same add-on over the same Supervisor-ingress connection.
+    same add-on over the same Supervisor-ingress connection. The Supervisor
+    requires the ingress session to belong to an active admin user, so it is
+    minted as ``user_id`` (the caller) rather than any ambient identity.
     """
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:
@@ -180,15 +190,15 @@ async def _async_connection(hass: HomeAssistant, slug: str | None):
     if target is None:
         target = await supervisor.async_dashboard_target(slug)
         cache[slug] = target
-    conn = await supervisor.open_dashboard_connection(target)
+    conn = await supervisor.open_dashboard_connection(target, user_id)
     return session, conn, slug
 
 
 async def _async_dashboard(
-    hass: HomeAssistant, slug: str | None
+    hass: HomeAssistant, slug: str | None, user_id: str | None
 ) -> tuple[DashboardClient, str]:
     """Legacy dashboard client (REST inventory/config + WS spawn) for an add-on."""
-    session, conn, slug = await _async_connection(hass, slug)
+    session, conn, slug = await _async_connection(hass, slug, user_id)
     return DashboardClient(session, conn.base_url, headers=conn.headers), slug
 
 
@@ -232,10 +242,10 @@ class _BuildClient:
 
 
 async def _async_build_client(
-    hass: HomeAssistant, slug: str | None
+    hass: HomeAssistant, slug: str | None, user_id: str | None
 ) -> tuple[_BuildClient, str]:
     """Build/stream client for an add-on: /ws primary, legacy spawn fallback."""
-    session, conn, slug = await _async_connection(hass, slug)
+    session, conn, slug = await _async_connection(hass, slug, user_id)
     ws = WsClient(session, conn.base_url, headers=conn.headers)
     legacy = DashboardClient(session, conn.base_url, headers=conn.headers)
     return _BuildClient(ws, legacy), slug
@@ -301,11 +311,12 @@ async def _run_job(
     method: str,
     configuration: str,
     addon_slug: str | None,
+    user_id: str | None,
     extra: dict[str, Any],
 ) -> None:
     """Background driver: run a build command, streaming lines into the job."""
     try:
-        client, _ = await _async_build_client(hass, addon_slug)
+        client, _ = await _async_build_client(hass, addon_slug, user_id)
         result = await getattr(client, method)(
             configuration, on_line=job.lines.append, **extra
         )
@@ -325,12 +336,13 @@ def _start_background_job(
     method: str,
     configuration: str,
     addon_slug: str | None,
+    user_id: str | None,
     extra: dict[str, Any],
 ) -> dict[str, Any]:
     """Create a job, launch it as an HA background task, return its initial state."""
     job = _job_registry(hass).create(kind, configuration, addon_slug)
     hass.async_create_background_task(
-        _run_job(hass, job, method, configuration, addon_slug, extra),
+        _run_job(hass, job, method, configuration, addon_slug, user_id, extra),
         name=f"esphome_mcp_bridge_{kind}_{job.id}",
     )
     response = job.to_dict()
@@ -401,7 +413,9 @@ class ListDevicesTool(llm.Tool):
         self, hass: HomeAssistant, tool_input: llm.ToolInput, llm_context: llm.LLMContext
     ) -> dict[str, Any]:
         try:
-            client, slug = await _async_dashboard(hass, tool_input.tool_args.get("addon_slug"))
+            client, slug = await _async_dashboard(
+                hass, tool_input.tool_args.get("addon_slug"), _user_id(llm_context)
+            )
             devices = await client.inventory()
         except ESPHomeMCPError as err:
             return {"error": str(err)}
@@ -592,13 +606,14 @@ class _BuildTool(llm.Tool):
             configuration = _guard(args["configuration"], require_yaml=True)
         except ValueError as err:
             return {"error": str(err)}
+        user_id = _user_id(llm_context)
         if self._supports_background and args.get("background"):
             return _start_background_job(
                 hass, self._method, self._method, configuration,
-                args.get("addon_slug"), {},
+                args.get("addon_slug"), user_id, {},
             )
         try:
-            client, slug = await _async_build_client(hass, args.get("addon_slug"))
+            client, slug = await _async_build_client(hass, args.get("addon_slug"), user_id)
             result = await getattr(client, self._method)(configuration)
         except ESPHomeMCPError as err:
             return {"error": str(err)}
@@ -672,13 +687,14 @@ class _FlashTool(llm.Tool):
         except ValueError as err:
             return {"error": str(err)}
         port = args.get("port", "OTA")
+        user_id = _user_id(llm_context)
         if args.get("background"):
             return _start_background_job(
                 hass, self._method, self._method, configuration,
-                args.get("addon_slug"), {"port": port},
+                args.get("addon_slug"), user_id, {"port": port},
             )
         try:
-            client, slug = await _async_build_client(hass, args.get("addon_slug"))
+            client, slug = await _async_build_client(hass, args.get("addon_slug"), user_id)
             result = await getattr(client, self._method)(configuration, port)
         except ESPHomeMCPError as err:
             return {"error": str(err)}
@@ -753,13 +769,14 @@ class LogsTool(llm.Tool):
         max_seconds = args.get("max_seconds", 30)
         address = args.get("address")
         addon_slug = args.get("addon_slug")
+        user_id = _user_id(llm_context)
 
         # Identify the device (name + address) from dashboard inventory.
         name: str | None = None
         dash_client: DashboardClient | None = None
         slug: str | None = None
         try:
-            dash_client, slug = await _async_dashboard(hass, addon_slug)
+            dash_client, slug = await _async_dashboard(hass, addon_slug, user_id)
             for dev in await dash_client.inventory():
                 if dev.get("configuration") == configuration:
                     name = dev.get("name")
@@ -798,7 +815,7 @@ class LogsTool(llm.Tool):
                 "in Home Assistant for direct log streaming."
             }
         try:
-            build_client, _ = await _async_build_client(hass, addon_slug)
+            build_client, _ = await _async_build_client(hass, addon_slug, user_id)
             result = await build_client.logs(configuration, "OTA", max_seconds=max_seconds)
         except ESPHomeMCPError as err:
             msg = str(err)

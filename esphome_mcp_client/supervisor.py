@@ -94,46 +94,47 @@ class SupervisorClient:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token}"}
 
-    async def _get(self, path: str) -> dict:
-        """GET a Supervisor endpoint and return the unwrapped ``data`` object."""
+    async def _request(self, method: str, path: str, json: dict | None = None) -> dict:
+        """Call a Supervisor endpoint and return the unwrapped ``data`` object.
+
+        On failure the Supervisor's own ``message`` is included in the error
+        (it names e.g. a missing request field), not just the HTTP status.
+        """
         url = f"{self._base_url}{path}"
         try:
-            async with self._session.get(
+            async with self._session.request(
+                method,
                 url,
                 headers=self._headers,
+                json=json,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
-                resp.raise_for_status()
-                payload = await resp.json()
+                try:
+                    payload = await resp.json(content_type=None)
+                except ValueError:
+                    payload = None
+                if resp.status >= 400:
+                    detail = (
+                        payload.get("message")
+                        if isinstance(payload, dict) and payload.get("message")
+                        else resp.reason
+                    )
+                    raise SupervisorError(
+                        f"Supervisor {method} {path} failed: {resp.status} {detail}"
+                    )
         except aiohttp.ClientError as err:
-            raise SupervisorError(f"Supervisor GET {path} failed: {err}") from err
+            raise SupervisorError(f"Supervisor {method} {path} failed: {err}") from err
 
-        if payload.get("result") != "ok":
-            raise SupervisorError(
-                f"Supervisor GET {path} returned: {payload.get('message', payload)}"
-            )
+        if not isinstance(payload, dict) or payload.get("result") != "ok":
+            message = payload.get("message", payload) if isinstance(payload, dict) else payload
+            raise SupervisorError(f"Supervisor {method} {path} returned: {message}")
         return payload.get("data", {})
+
+    async def _get(self, path: str) -> dict:
+        return await self._request("GET", path)
 
     async def _post(self, path: str, json: dict | None = None) -> dict:
-        """POST a Supervisor endpoint and return the unwrapped ``data`` object."""
-        url = f"{self._base_url}{path}"
-        try:
-            async with self._session.post(
-                url,
-                headers=self._headers,
-                json=json if json is not None else {},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                resp.raise_for_status()
-                payload = await resp.json()
-        except aiohttp.ClientError as err:
-            raise SupervisorError(f"Supervisor POST {path} failed: {err}") from err
-
-        if payload.get("result") != "ok":
-            raise SupervisorError(
-                f"Supervisor POST {path} returned: {payload.get('message', payload)}"
-            )
-        return payload.get("data", {})
+        return await self._request("POST", path, json if json is not None else {})
 
     async def list_esphome_addons(self) -> list[AddonInfo]:
         """Return all installed add-ons that look like ESPHome dashboards."""
@@ -213,29 +214,41 @@ class SupervisorClient:
         port = info.get("ingress_port") or DEFAULT_DASHBOARD_PORT
         return DashboardTarget(base_url=f"http://{hostname}:{port}", ingress_token=None)
 
-    async def create_ingress_session(self) -> str:
-        """Create a Supervisor ingress session and return its id.
+    async def create_ingress_session(self, user_id: str) -> str:
+        """Create a Supervisor ingress session for a HA user and return its id.
+
+        Since Supervisor 2026.10 the session must name an active Home Assistant
+        user (``user_id``); a body without it is rejected with 400. For apps
+        that set ``panel_admin`` (ESPHome does), the proxy additionally answers
+        403 unless that user is an admin.
 
         The id must be sent back as the ``ingress_session`` cookie on every
         proxied request; the proxy validates it (and extends its TTL) per call.
         """
-        data = await self._post("/ingress/session")
+        data = await self._post("/ingress/session", {"user_id": user_id})
         session = data.get("session")
         if not session:
             raise SupervisorError("Supervisor did not return an ingress session")
         return session
 
     async def open_dashboard_connection(
-        self, target: DashboardTarget
+        self, target: DashboardTarget, user_id: str | None = None
     ) -> DashboardConnection:
         """Turn a (cached) :class:`DashboardTarget` into a live connection.
 
-        For proxied targets this mints a fresh ingress session so a long-lived
-        cache never hands out an expired one; direct targets need no auth.
+        For proxied targets this mints a fresh ingress session owned by
+        ``user_id`` so a long-lived cache never hands out an expired one;
+        direct targets need no auth and ignore ``user_id``.
         """
         if target.ingress_token is None:
             return DashboardConnection(base_url=target.base_url, headers={})
-        session = await self.create_ingress_session()
+        if not user_id:
+            raise SupervisorError(
+                "Reaching the ESPHome dashboard through Supervisor ingress "
+                "requires the Home Assistant user making the request, but none "
+                "was provided."
+            )
+        session = await self.create_ingress_session(user_id)
         return DashboardConnection(
             base_url=target.base_url,
             headers={"Cookie": f"ingress_session={session}"},

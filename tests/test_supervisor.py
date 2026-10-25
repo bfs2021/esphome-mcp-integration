@@ -1,8 +1,10 @@
 """Tests for the Supervisor client: discovery, ranking, URL resolution."""
 import aiohttp
 import pytest
+from aiohttp import web
 
 from esphome_mcp_client import AddonNotFoundError, SupervisorClient
+from esphome_mcp_client.exceptions import SupervisorError
 from esphome_mcp_client.supervisor import DashboardTarget
 
 from .conftest import json_route, make_app
@@ -83,21 +85,55 @@ async def test_dashboard_target_falls_back_to_direct_without_ingress(serve, sess
     )
 
 
-async def test_create_ingress_session_returns_id(serve, session):
-    payload = {"result": "ok", "data": {"session": "sess-xyz"}}
-    base = await serve(make_app([("POST", "/ingress/session", json_route(payload))]))
+def _session_route(seen: list):
+    """Mimic Supervisor 2026.10+: ``user_id`` is required, else 400 + message."""
+
+    async def handler(request: web.Request) -> web.Response:
+        body = await request.json()
+        seen.append(body)
+        if "user_id" not in body:
+            return web.json_response(
+                {"result": "error", "message": "required key not provided @ data['user_id']"},
+                status=400,
+            )
+        return web.json_response({"result": "ok", "data": {"session": "sess-xyz"}})
+
+    return handler
+
+
+async def test_create_ingress_session_sends_user_id(serve, session):
+    seen: list = []
+    base = await serve(make_app([("POST", "/ingress/session", _session_route(seen))]))
     client = SupervisorClient(session, token="tok", base_url=base)
-    assert await client.create_ingress_session() == "sess-xyz"
+    assert await client.create_ingress_session("user-1") == "sess-xyz"
+    assert seen == [{"user_id": "user-1"}]
+
+
+async def test_supervisor_error_includes_message(serve, session):
+    # A 400 must surface the Supervisor's reason, not just "Bad Request".
+    seen: list = []
+    base = await serve(make_app([("POST", "/ingress/session", _session_route(seen))]))
+    client = SupervisorClient(session, token="tok", base_url=base)
+    with pytest.raises(SupervisorError, match=r"400 required key not provided"):
+        await client._post("/ingress/session")
 
 
 async def test_open_connection_mints_session_cookie_for_proxy(serve, session):
-    payload = {"result": "ok", "data": {"session": "sess-xyz"}}
-    base = await serve(make_app([("POST", "/ingress/session", json_route(payload))]))
+    seen: list = []
+    base = await serve(make_app([("POST", "/ingress/session", _session_route(seen))]))
     client = SupervisorClient(session, token="tok", base_url=base)
     target = DashboardTarget(base_url=f"{base}/ingress/tok123", ingress_token="tok123")
-    conn = await client.open_dashboard_connection(target)
+    conn = await client.open_dashboard_connection(target, "user-1")
     assert conn.base_url == f"{base}/ingress/tok123"
     assert conn.headers == {"Cookie": "ingress_session=sess-xyz"}
+    assert seen == [{"user_id": "user-1"}]
+
+
+async def test_open_connection_proxy_requires_user(session):
+    client = SupervisorClient(session, token="tok", base_url="http://unused")
+    target = DashboardTarget(base_url="http://unused/ingress/tok123", ingress_token="tok123")
+    with pytest.raises(SupervisorError, match="requires the Home Assistant user"):
+        await client.open_dashboard_connection(target, None)
 
 
 async def test_open_connection_direct_target_has_no_auth(serve, session):
